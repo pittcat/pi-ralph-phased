@@ -1,6 +1,6 @@
 /**
- * U8+U9 Fake Pi: minimal stand-in for the ExtensionAPI surface used by these
- * units.
+ * U8+U9+U10 Fake Pi: minimal stand-in for the ExtensionAPI surface used
+ * by these units.
  *
  * Only records `on(event, handler)` registrations and `registerTool(name, def)`
  * calls, plus enough state to replay the events the tests need to drive.
@@ -10,6 +10,11 @@
  * extension advance path can be asserted without instantiating a real Pi
  * runtime. The port keeps a chronological list of every
  * `newSession`/`sendUserMessage`/`waitForIdle` invocation.
+ *
+ * U10 widening: the fake also records `tool_call` handlers and exposes
+ * `invokeToolCall(event)` so the early-emit guard wiring can be asserted
+ * end-to-end. The event shape is kept minimal (toolName + args) because the
+ * extension's seam only reads those two fields.
  *
  * Deliberately still omits any persistence, message-store, or provider-side
  * surface — U11 will own those.
@@ -36,6 +41,30 @@ interface FakeAgentSettledHandler {
   (event: unknown, ctx: unknown): unknown;
 }
 
+interface FakeToolCallHandler {
+  (event: unknown, ctx: unknown): unknown;
+}
+
+/**
+ * Structural shape of a Pi `tool_call` event reduced to what the U10
+ * wiring reads. Real Pi delivers a richer shape; the fake preserves only
+ * `toolName` and `args` because the seam never reads anything else.
+ */
+export interface FakeToolCallEvent {
+  toolName: string;
+  args: Record<string, unknown>;
+}
+
+/**
+ * Result returned by the extension's `tool_call` handler when it decides to
+ * block. `undefined` (no return value) means pass-through. This mirrors
+ * what the real Pi 0.81.1 documents for `pi.on("tool_call", ...)` handlers.
+ */
+export type FakeToolCallResult =
+  | { block: true; reason: string }
+  | { block: false; reason?: string }
+  | undefined;
+
 /**
  * Structural shape exposed to `agent_settled` handlers in U9. The real Pi
  * `ExtensionContext` does NOT declare `newSession`, `sendUserMessage`, or
@@ -58,6 +87,7 @@ interface FakeHandlerRegistry {
   "before_agent_start": FakeBeforeAgentStartHandler[];
   "context": FakeContextHandler[];
   "agent_settled": FakeAgentSettledHandler[];
+  "tool_call": FakeToolCallHandler[];
 }
 
 /**
@@ -133,6 +163,7 @@ export class FakeExtensionAPI {
     "before_agent_start": [],
     "context": [],
     "agent_settled": [],
+    "tool_call": [],
   };
   readonly #tools: FakeRegisteredTool[] = [];
   readonly session: FakeSessionPort = new FakeSessionPort();
@@ -141,9 +172,15 @@ export class FakeExtensionAPI {
   on(event: "before_agent_start", handler: FakeBeforeAgentStartHandler): void;
   on(event: "context", handler: FakeContextHandler): void;
   on(event: "agent_settled", handler: FakeAgentSettledHandler): void;
+  on(event: "tool_call", handler: FakeToolCallHandler): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
   on(
-    event: "before_agent_start" | "context" | "agent_settled" | string,
+    event:
+      | "before_agent_start"
+      | "context"
+      | "agent_settled"
+      | "tool_call"
+      | string,
     handler: (...args: unknown[]) => unknown,
   ): void {
     if (event === "before_agent_start") {
@@ -158,6 +195,10 @@ export class FakeExtensionAPI {
       this.#handlers["agent_settled"].push(handler as FakeAgentSettledHandler);
       return;
     }
+    if (event === "tool_call") {
+      this.#handlers["tool_call"].push(handler as FakeToolCallHandler);
+      return;
+    }
     throw new Error(`FakeExtensionAPI: unsupported event '${event}'`);
   }
 
@@ -165,7 +206,9 @@ export class FakeExtensionAPI {
     this.#tools.push({ name: definition.name, definition });
   }
 
-  hasHandler(event: "before_agent_start" | "context" | "agent_settled"): boolean {
+  hasHandler(
+    event: "before_agent_start" | "context" | "agent_settled" | "tool_call",
+  ): boolean {
     return this.#handlers[event].length > 0;
   }
 
@@ -204,6 +247,28 @@ export class FakeExtensionAPI {
     );
     for (const handler of this.#handlers["agent_settled"]) {
       const result = await handler(event, ctx);
+      if (result !== undefined) return result;
+    }
+    return undefined;
+  }
+
+  /**
+   * U10 — replay a `tool_call` event through every registered handler and
+   * return the first non-`undefined` decision. `undefined` from every
+   * handler means pass-through. Defensive: accepts null/undefined/missing
+   * event shapes without throwing so tests can probe the boundary.
+   *
+   * The ctx deliberately exposes `store` (same U9-only test seam) so ATDD
+   * tests can pre-fill session state without invoking `before_agent_start`.
+   * Production Pi 0.81.1 never sets `store` on a `tool_call` ctx, so the
+   * production path ignores it.
+   */
+  async invokeToolCall(event: FakeToolCallEvent | null | undefined): Promise<FakeToolCallResult> {
+    const handlers = this.#handlers["tool_call"];
+    if (handlers.length === 0) return undefined;
+    const ctx: { store: FakeSessionStore } = { store: this.store };
+    for (const handler of handlers) {
+      const result = (await handler(event, ctx)) as FakeToolCallResult;
       if (result !== undefined) return result;
     }
     return undefined;

@@ -12,6 +12,11 @@ import { rewriteContextMessages } from "./context-rewrite.js";
 import { executeStageDoneTool } from "./tools/stage-done.js";
 import { createStageMachine } from "./stage-machine.js";
 import { advanceAfterSettled, type SessionAdvancePort } from "./advance.js";
+import {
+  resolveToolCallGuard,
+  type ToolCallGuardPort,
+  type ToolCallEventShape,
+} from "./tool-call-guard.js";
 import type { RalphSessionState, StageId } from "./types.js";
 
 /**
@@ -52,7 +57,13 @@ interface ContextEventResultLike {
  * - U9 (agent_settled, newSession, sendUserMessage, waitForIdle) is now
  *   registered below — `agent_settled` calls `advanceAfterSettled` which
  *   only reads `waitForIdle?/newSession/sendUserMessage?` off the host
- *   context (Fake or real Pi). U10 (tool_call emit guard) remains for U10.
+ *   context (Fake or real Pi).
+ * - U10 (tool_call emit guard) — also registered below. It only listens to
+ *   the `bash` (and `shell` alias) tool, derives `stageIsLast` /
+ *   `command` / `publishTopics` from the in-memory session state, and
+ *   delegates to the pure `shouldBlockTerminalEmit` seam. When no active
+ *   session exists (kill-switch S2 path), it returns `undefined` so the
+ *   call passes through untouched.
  */
 
 interface RalphStageDoneParams {
@@ -84,6 +95,9 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
 
   pi.on("agent_settled" as never, (((event: unknown, ctx: unknown) =>
     handleAgentSettled(event, ctx, store)) as unknown) as never);
+
+  pi.on("tool_call" as never, (((event: unknown, ctx: unknown) =>
+    handleToolCall(event, ctx, store)) as unknown) as never);
 
   pi.registerTool({
     name: "ralph_stage_done",
@@ -229,4 +243,45 @@ function readSeededState(ctx: unknown): RalphSessionState | undefined {
   if (ctx === null || typeof ctx !== "object") return undefined;
   const store = (ctx as { store?: { active?: RalphSessionState | undefined } }).store;
   return store?.active;
+}
+
+/**
+ * U10 — `tool_call` handler. Delegates to the pure
+ * {@link resolveToolCallGuard} seam and returns whatever it returns
+ * (possibly `undefined` for pass-through, or `{ block: true, reason }` on
+ * the non-last-path early-emit block). The handler MUST NOT mutate the
+ * session state on a block — S13 requires that the current stage is left
+ * uncompleted.
+ *
+ * Pi's `tool_call` event shape is reduced to `{ toolName, args }` here; the
+ * pure seam is responsible for field selection (`command` vs `cmd`,
+ * `toolName` allowlist). Real Pi 0.81.1 documents that a `tool_call`
+ * handler returning `{ block: true }` cancels execution; returning
+ * `undefined` lets the tool proceed.
+ */
+function handleToolCall(
+  event: unknown,
+  ctx: unknown,
+  store: SessionStateStore,
+): unknown {
+  // Defensive: if Pi ever delivers an event without a useful shape, we
+  // pass through rather than throw. The pure seam will also bail out.
+  if (event === null || typeof event !== "object") return undefined;
+  const ev = event as Partial<ToolCallEventShape>;
+  if (typeof ev.toolName !== "string") return undefined;
+  const args: Record<string, unknown> =
+    ev.args !== undefined && typeof ev.args === "object" && ev.args !== null
+      ? (ev.args as Record<string, unknown>)
+      : {};
+
+  const port: ToolCallGuardPort = {
+    activeState: () => store.active ?? readSeededState(ctx),
+    markStageDone: () => {
+      // Reserved seam. Per plan, blocking a tool_call MUST NOT implicitly
+      // complete the current stage; the model must call ralph_stage_done
+      // explicitly.
+    },
+  };
+
+  return resolveToolCallGuard({ toolName: ev.toolName, args }, port);
 }

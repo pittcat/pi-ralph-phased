@@ -1,13 +1,50 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   FakeExtensionAPI,
   type FakeSessionPort,
 } from "../fakes/fake-pi.js";
 import piRalphPhased from "../../src/index.js";
+import * as parseModule from "../../src/parse.js";
 import { parseRalphPrompt } from "../../src/parse.js";
 import { createSessionState } from "../../src/session-state.js";
 import type { RalphSessionState, StageId } from "../../src/types.js";
+
+// vi.mock with a spy factory: every export of `parse.js` becomes a
+// vi.fn that delegates to the real implementation by default. The
+// parse-fail test below overrides `parseRalphPrompt` via the spy to
+// exercise the defensive "takeover-eligible but parse fails" branch,
+// which is otherwise unreachable on real prompts because shouldTakeover
+// and parseRalphPrompt currently accept the same recognized-stage
+// headings. The spy preserves the real implementation for every other
+// test in this file, so `parseRalph()` and the seeded-state helpers
+// keep working.
+vi.mock("../../src/parse.js", async (importActual) => {
+  const actual = await importActual<typeof parseModule>();
+  return {
+    ...actual,
+    parseRalphPrompt: vi.fn(actual.parseRalphPrompt),
+  };
+});
+
+// vi.mock persist.js with a spy factory so the U4 R8 seed step can call
+// `handleBeforeAgentStart` with a real Ralph prompt WITHOUT writing a
+// `pi-ralph-phased-*` temp file. The pre-existing U8 S1 test in
+// `extension-first-turn.atdd.test.ts` snapshots the temp-dir contents
+// before and after a short-prompt call and asserts the snapshot is
+// unchanged; if this file's U4 R8 tests run in parallel and write temp
+// files, U8 S1 races and flakes. Spying persist.js lets us keep the
+// real extension handler chain (parse + set state + return undefined)
+// while replacing the side-effecting disk write with a deterministic
+// in-memory stub that still gives `store.set(state)` a sensible
+// `fullPromptPath` to put on the state object.
+vi.mock("../../src/persist.js", async (importActual) => {
+  const actual = await importActual<typeof import("../../src/persist.js")>();
+  return {
+    ...actual,
+    persistFullPrompt: vi.fn(async () => "/tmp/pi-ralph-phased-stub/no-disk-write.md"),
+  };
+});
 
 /**
  * U9 ATDD — agent_settled advance + newSession reset (Fake context).
@@ -474,5 +511,134 @@ describe("U9 ATDD — end-to-end through tool execute", () => {
     // Tool execution must NEVER have called any session port — the port is
     // reserved for the agent_settled hook.
     expect(fake.session.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * U4 R8 ATDD — handleBeforeAgentStart must clear the in-process
+ * SessionStateStore on every non-takeover early-return path.
+ *
+ * Scenario the fix targets:
+ *   The current implementation has two early-return branches that leave
+ *   `store.active` untouched:
+ *     (a) `shouldTakeover` returns false (prompt is not a Ralph dump).
+ *     (b) `shouldTakeover` returns true but `parseRalphPrompt` returns
+ *         null (defensive — currently unreachable on real prompts
+ *         because the two functions accept the same heading set, but
+ *         the branch must still be guarded so a future detector change
+ *         does not regress this invariant).
+ *   In a Pi print/headless run with multiple activations, a stale
+ *   `store.active` from a previous activation would leak into the next
+ *   `context` handler and rewrite the wrong user message. The fix is to
+ *   `store.clear()` BEFORE every early return, so the only state
+ *   surviving a `before_agent_start` call is the one the function
+ *   actually committed to.
+ *
+ * Observable probe:
+ *   The in-process `SessionStateStore` created inside `piRalphPhased` is
+ *   the same store `handleContext` reads from. If `store.active` is set,
+ *   `handleContext` rewrites the user message and returns `{ messages:
+ *   [...] }`; if it is undefined, `handleContext` returns undefined. We
+ *   use that delta as the only externally-visible signal without
+ *   exporting the in-process store or extending the Fake surface.
+ */
+describe("U4 R8 ATDD — handleBeforeAgentStart clears store.active on early returns", () => {
+  const NON_TAKEOVER_PROMPT = "just a normal user question, nothing to see here";
+
+  interface FakeTextPart {
+    type: "text";
+    text: string;
+  }
+
+  interface FakeUserMessage {
+    role: "user";
+    content: FakeTextPart[];
+  }
+
+  function userMessage(text: string): FakeUserMessage {
+    return { role: "user", content: [{ type: "text", text }] };
+  }
+
+  async function invokeBeforeAgentStart(
+    fake: FakeExtensionAPI,
+    prompt: string,
+  ): Promise<unknown> {
+    return fake.invokeBeforeAgentStart({
+      prompt,
+      systemPrompt: "sys",
+      systemPromptOptions: { skills: [], projectContext: [] } as never,
+    } as never);
+  }
+
+  /**
+   * Probe `store.active` via the only observable side-effect the
+   * extension exposes: `handleContext` rewrites messages when active is
+   * set and returns undefined when it is not. We deliberately do not
+   * assert on the rewritten content here — U8's first-turn ATDD owns
+   * that. We only assert on the "rewrite happened" vs "rewrite did not
+   * happen" delta.
+   */
+  async function contextRewriteHappened(
+    fake: FakeExtensionAPI,
+    prompt: string,
+  ): Promise<boolean> {
+    const result = (await fake.invokeContext({
+      type: "context",
+      messages: [userMessage(prompt)] as unknown as never[],
+    } as never)) as { messages?: unknown } | undefined;
+    return result !== undefined && result.messages !== undefined;
+  }
+
+  it("clears store.active on non-takeover prompt", async () => {
+    const fake = await loadExtension();
+
+    // 1. Seed the in-process store by performing a successful takeover.
+    //    After this step, store.active is defined, so handleContext
+    //    would rewrite messages.
+    await invokeBeforeAgentStart(fake, STANDARD_RALPH);
+    expect(await contextRewriteHappened(fake, STANDARD_RALPH)).toBe(true);
+
+    // 2. Now run the same handler with a prompt that shouldTakeover
+    //    rejects. The current implementation returns early without
+    //    touching store.active; the fix must clear it.
+    await invokeBeforeAgentStart(fake, NON_TAKEOVER_PROMPT);
+
+    // 3. Probe: handleContext must now pass through (return undefined)
+    //    because the in-process store is empty.
+    expect(await contextRewriteHappened(fake, STANDARD_RALPH)).toBe(false);
+  });
+
+  it("clears store.active when takeover-eligible but parseRalphPrompt returns null", async () => {
+    const fake = await loadExtension();
+
+    // 1. Seed the in-process store with a real takeover so the
+    //    post-clear probe has something to compare against.
+    await invokeBeforeAgentStart(fake, STANDARD_RALPH);
+    expect(await contextRewriteHappened(fake, STANDARD_RALPH)).toBe(true);
+
+    // 2. Force the defensive branch: shouldTakeover will accept the
+    //    Ralph prompt (count >= 2 recognized stages + strong signal),
+    //    but parseRalphPrompt is overridden to return null. The fix
+    //    must clear the in-process store even though shouldTakeover
+    //    itself said yes.
+    const spy = vi.mocked(parseModule.parseRalphPrompt);
+    const realImplementation = spy.getMockImplementation();
+    spy.mockReturnValue(null);
+    try {
+      await invokeBeforeAgentStart(fake, STANDARD_RALPH);
+    } finally {
+      // Restore the spy so any later test in this file gets the real
+      // parser back. (No later test calls invokeBeforeAgentStart today,
+      // but this is defensive against future additions.)
+      if (realImplementation !== undefined) {
+        spy.mockImplementation(realImplementation);
+      } else {
+        spy.mockRestore();
+      }
+    }
+
+    // 3. Probe: store.active must be cleared. handleContext returning
+    //    undefined proves it.
+    expect(await contextRewriteHappened(fake, STANDARD_RALPH)).toBe(false);
   });
 });

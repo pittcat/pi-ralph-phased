@@ -145,6 +145,12 @@ async function handleBeforeAgentStart(
   event: BeforeAgentStartEvent,
   store: SessionStateStore,
 ): Promise<BeforeAgentStartEventResultLike | void> {
+  // U4 R8: clear the in-process store before any early return so a stale
+  // activation from a previous run cannot leak into the next `context`
+  // rewrite. The only state that must survive this hook is the one we
+  // commit to via `store.set(newState)` at the bottom of this function.
+  store.clear();
+
   if (!shouldTakeover(event.prompt, process.env)) return;
 
   const parsed = parseRalphPrompt(event.prompt);

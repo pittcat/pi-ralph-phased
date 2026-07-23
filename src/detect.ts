@@ -1,24 +1,30 @@
-import type { ParsedRalphPrompt } from "./types.js";
+export type RalphEnvironment = Readonly<Record<string, string | undefined>>;
 
-export type RalphEnvironment = Readonly<
-  Record<string, string | undefined>
->;
+const RECOGNIZED_STAGE_HEADING =
+  /^###\s+(?:0\.\s+ORIENTATION|0b\.\s+TOOL DISCIPLINE|1\.\s+EXECUTE|2\.\s+VERIFY|3\.\s+REPORT)\s*$/gim;
 
-/**
- * Safe scaffold behavior: never take over until U1/U2 tests lock down both the
- * detection heuristic and parser agreement. False negatives are preferable to
- * leaking a false-positive prompt into the phased path.
- */
+const STRONG_RALPH_SIGNALS = [
+  /\bralph\s+emit\b/i,
+  /<ralph-tools-skill(?:\s[^>]*)?>/i,
+  /\byou\s+are\b[^\r\n]*\bralph\b[^\r\n]*\bhat\b/i,
+  /\byou\s+are\b[^\r\n]*\bralph\b[^\r\n]*\bautonomous\b/i,
+] as const;
+
+/** Decide conservatively whether a prompt is a Ralph activation dump. */
 export function shouldTakeover(
-  _prompt: string,
+  prompt: string,
   env: RalphEnvironment,
-  _parsed?: ParsedRalphPrompt | null,
 ): boolean {
   if (env.RALPH_PI_PHASED === "0") {
     return false;
   }
 
-  // TODO(U1): require >=2 recognized stage headings plus a strong Ralph signal.
-  // TODO(U2): decide whether parser success is mandatory or only corroborating.
-  return false;
+  const recognizedStageCount = Array.from(
+    prompt.matchAll(RECOGNIZED_STAGE_HEADING),
+  ).length;
+
+  return (
+    recognizedStageCount >= 2 &&
+    STRONG_RALPH_SIGNALS.some((signal) => signal.test(prompt))
+  );
 }

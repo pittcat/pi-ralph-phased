@@ -11,6 +11,7 @@ import { createSessionState, SessionStateStore } from "./session-state.js";
 import { rewriteContextMessages } from "./context-rewrite.js";
 import { executeStageDoneTool } from "./tools/stage-done.js";
 import { createStageMachine } from "./stage-machine.js";
+import { advanceAfterSettled, type SessionAdvancePort } from "./advance.js";
 import type { RalphSessionState, StageId } from "./types.js";
 
 /**
@@ -48,8 +49,10 @@ interface ContextEventResultLike {
  *   as a direct dependency. Pi's `ToolDefinition.parameters` is typed
  *   `TSchema`; passing an object that conforms to that shape works at the
  *   Pi runtime boundary — U11 will replace this with the official helper.
- * - U9 (agent_settled, newSession, sendUserMessage, waitForIdle) and U10
- *   (tool_call emit guard) are deliberately NOT registered here.
+ * - U9 (agent_settled, newSession, sendUserMessage, waitForIdle) is now
+ *   registered below — `agent_settled` calls `advanceAfterSettled` which
+ *   only reads `waitForIdle?/newSession/sendUserMessage?` off the host
+ *   context (Fake or real Pi). U10 (tool_call emit guard) remains for U10.
  */
 
 interface RalphStageDoneParams {
@@ -78,6 +81,9 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
 
   pi.on("context" as never, (((event: ContextEvent) =>
     handleContext(event, store)) as unknown) as never);
+
+  pi.on("agent_settled" as never, (((event: unknown, ctx: unknown) =>
+    handleAgentSettled(event, ctx, store)) as unknown) as never);
 
   pi.registerTool({
     name: "ralph_stage_done",
@@ -180,4 +186,47 @@ function applyTransition(
     currentStage: transition.advancedTo,
     completedStages: completed,
   };
+}
+
+/**
+ * U9 handler for `agent_settled`.
+ *
+ * After every model turn, Pi delivers an `agent_settled` event. We translate
+ * that into an awaited host session-port call so the next stage begins in a
+ * fresh session — the only mechanism that actually resets Pi's accumulated
+ * --no-session history. Sending another user message here would merely stack
+ * tokens; the plan and S11 explicitly forbid that. S12 forbids advancing on
+ * the actual last stage.
+ *
+ * The Pi 0.81.1 `ExtensionContext` typed for `agent_settled` does NOT expose
+ * `newSession`, `sendUserMessage`, or `waitForIdle` (those appear only on
+ * `ExtensionCommandContext`). Until a runtime spike proves the surface in the
+ * real handler — see docs/SCAFFOLD_DECISIONS.md item 1 — we cast through
+ * `unknown`. The Fake's FakeAgentSettledContext satisfies the same shape.
+ */
+async function handleAgentSettled(
+  _event: unknown,
+  ctx: unknown,
+  store: SessionStateStore,
+): Promise<void> {
+  const state = store.active ?? readSeededState(ctx);
+  if (state === undefined) return;
+
+  const port = ctx as SessionAdvancePort;
+  await advanceAfterSettled(state, port);
+}
+
+/**
+ * Test-only fallback: when a host wires the agent_settled ctx with a
+ * `{ store?: { active?: RalphSessionState } }` property, prefer that seeded
+ * state over the empty in-process store. Production Pi 0.81.1 never sets
+ * this — the field stays `undefined` and we fall through to the regular
+ * store. U9 ATDD uses this to drive `agent_settled` without going through
+ * `before_agent_start` (and thus without writing a tmp file the U8
+ * first-turn diff snapshot is sensitive to).
+ */
+function readSeededState(ctx: unknown): RalphSessionState | undefined {
+  if (ctx === null || typeof ctx !== "object") return undefined;
+  const store = (ctx as { store?: { active?: RalphSessionState | undefined } }).store;
+  return store?.active;
 }

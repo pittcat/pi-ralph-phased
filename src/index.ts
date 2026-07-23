@@ -244,6 +244,7 @@ function applyTransition(
     ...state,
     currentStage: transition.advancedTo,
     completedStages: completed,
+    pendingAdvance: true,
   };
 }
 
@@ -256,6 +257,13 @@ function applyTransition(
  * --no-session history. Sending another user message here would merely stack
  * tokens; the plan and S11 explicitly forbid that. S12 forbids advancing on
  * the actual last stage.
+ *
+ * U2 gate: `agent_settled` is a no-op unless `state.pendingAdvance === true`.
+ * The gate is set by `handleStageDone` (which flips it to `true` on a legal
+ * advance) and cleared by `advanceAfterSettled` after a successful non-
+ * terminal advance. This ensures `newSession` is only called on turns where
+ * the model actually completed a stage; ordinary end-of-turn idle events do
+ * not trigger a session reset.
  *
  * The Pi 0.81.1 `ExtensionContext` typed for `agent_settled` does NOT expose
  * `newSession`, `sendUserMessage`, or `waitForIdle` (those appear only on
@@ -271,8 +279,21 @@ async function handleAgentSettled(
   const state = store.active ?? readSeededState(ctx);
   if (state === undefined) return;
 
+  // U2 gate: only advance when a prior ralph_stage_done marked the session
+  // as pending. Ordinary idle agent_settled events must not reset the
+  // session.
+  if (state.pendingAdvance !== true) return;
+
   const port = ctx as SessionAdvancePort;
   await advanceAfterSettled(state, port);
+  const next = { ...state, pendingAdvance: false };
+  store.set(next);
+  if (ctx !== null && typeof ctx === "object") {
+    const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
+    if (seededStore !== undefined && typeof seededStore.set === "function") {
+      seededStore.set(next);
+    }
+  }
 }
 
 /**

@@ -99,11 +99,17 @@ async function driveStageDone(
  * Build a seed state whose `completedStages` includes the stages the test
  * wants to claim have already happened. We compose `createSessionState` and
  * post-mutate the resulting state's completedStages set.
+ *
+ * U2: by default the seed sets `pendingAdvance: true` so the existing happy-
+ * path `agent_settled` tests keep firing through the gate. Pass
+ * `pendingAdvance: false` explicitly when a test wants to assert the
+ * `agent_settled` no-op behavior.
  */
 function seed(
   fake: FakeExtensionAPI,
   currentStage: StageId,
   completed: ReadonlyArray<StageId>,
+  options: { pendingAdvance?: boolean } = {},
 ): void {
   const parsed = parsedRalph();
   const base = createSessionState({
@@ -114,7 +120,11 @@ function seed(
     currentStage,
   });
   const completedSet = new Set<StageId>(completed);
-  const seeded: RalphSessionState = { ...base, completedStages: completedSet };
+  const seeded: RalphSessionState = {
+    ...base,
+    completedStages: completedSet,
+    pendingAdvance: options.pendingAdvance ?? true,
+  };
   fake.store.set(seeded);
 }
 
@@ -221,6 +231,80 @@ describe("U9 ATDD — no overlap with U8 first-turn surface", () => {
     expect(fake.hasHandler("context")).toBe(true);
     expect(fake.hasHandler("agent_settled")).toBe(true);
     expect(fake.registeredTools().some((t) => t.name === "ralph_stage_done")).toBe(true);
+  });
+});
+
+describe("U2 ATDD — pendingAdvance gate", () => {
+  it("does NOT call newSession when pendingAdvance is false on agent_settled", async () => {
+    const fake = await loadExtension();
+    // Seed a mid-session state but explicitly mark pendingAdvance: false —
+    // this simulates the steady-state between stages where no ralph_stage_done
+    // has just been called and the model turn has merely gone idle.
+    seed(fake, "tool_discipline", ["orientation"], { pendingAdvance: false });
+
+    fake.session.calls.length = 0;
+    await fake.invokeAgentSettled({});
+
+    expect(fake.session.newSessionCalls()).toHaveLength(0);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(0);
+    expect(fake.session.waitForIdleCalls()).toHaveLength(0);
+  });
+
+  it("does NOT call newSession when pendingAdvance is false on the terminal stage either", async () => {
+    const fake = await loadExtension();
+    // Terminal stage with pendingAdvance: false — the model could go idle
+    // on the last stage without ever marking it done. The gate MUST short-
+    // circuit before any port method runs.
+    seed(fake, "report", ["orientation", "tool_discipline", "execute", "verify"], { pendingAdvance: false });
+
+    fake.session.calls.length = 0;
+    await fake.invokeAgentSettled({});
+
+    expect(fake.session.calls).toHaveLength(0);
+  });
+
+  it("does NOT mutate store.active.pendingAdvance when the gate short-circuits", async () => {
+    const fake = await loadExtension();
+    seed(fake, "execute", ["orientation", "tool_discipline"], { pendingAdvance: false });
+
+    await fake.invokeAgentSettled({});
+
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(false);
+  });
+
+  it("a successful ralph_stage_done sets store.active.pendingAdvance=true", async () => {
+    const fake = await loadExtension();
+    // Seed at orientation with pendingAdvance: false — the typical pre-
+    // completion steady state.
+    seed(fake, "orientation", [], { pendingAdvance: false });
+
+    // Mark orientation done through the wired handler chain.
+    await driveStageDone(fake, {
+      tool_call_id: "tc-orientation-1",
+      name: "ralph_stage_done",
+      args: { stage: "orientation" },
+    });
+
+    // The handler MUST persist pendingAdvance=true on the live state so the
+    // next agent_settled (which always follows a tool call's model turn)
+    // passes the gate and triggers a newSession.
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(true);
+  });
+
+  it("a failed ralph_stage_done does NOT flip pendingAdvance to true", async () => {
+    const fake = await loadExtension();
+    seed(fake, "orientation", [], { pendingAdvance: false });
+
+    // Complete with a stage that does not match the current orientation —
+    // executeStageDoneTool will reject it.
+    await driveStageDone(fake, {
+      tool_call_id: "tc-bogus-1",
+      name: "ralph_stage_done",
+      args: { stage: "execute" },
+    });
+
+    // pendingAdvance MUST stay false because no legal advance happened.
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(false);
   });
 });
 

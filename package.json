@@ -1,0 +1,28 @@
+{
+  "name": "pi-ralph-phased",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Scaffold for phased Ralph prompt disclosure in Pi",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

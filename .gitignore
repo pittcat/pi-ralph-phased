@@ -1,0 +1,32 @@
+node_modules/
+coverage/
+dist/
+*.tsbuildinfo
+.envrc
+.ralph/
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# Ralph 运行时产物
+.ralph/
+
+# 日志
+*.log
+logs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE / 编辑器
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时 / 缓存
+*.tmp
+.cache/

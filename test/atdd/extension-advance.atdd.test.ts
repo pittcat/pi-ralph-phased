@@ -116,12 +116,15 @@ async function loadExtension(): Promise<FakeExtensionAPI> {
 async function driveStageDone(
   fake: FakeExtensionAPI,
   toolCall: FakeToolCall,
+  onAbort?: () => void,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   const tool = fake.registeredTools().find((t) => t.name === "ralph_stage_done");
   if (!tool) throw new Error("ralph_stage_done was not registered");
   const execute = tool.definition["execute"] as unknown as (
     toolCallId: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
     ctx?: unknown,
   ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
   // Mirror the U9 agent_settled seam: the fake exposes `store` on the
@@ -129,7 +132,10 @@ async function driveStageDone(
   // `readSeededState` fallback that `handleAgentSettled` uses. Production
   // Pi 0.81.1 never sets `store` on a tool ctx, so the production path
   // falls back to the in-memory store.
-  return execute(toolCall.tool_call_id, toolCall.args, { store: fake.store });
+  return execute(toolCall.tool_call_id, toolCall.args, undefined, undefined, {
+    store: fake.store,
+    ...(onAbort ? { abort: onAbort } : {}),
+  });
 }
 
 /**
@@ -169,6 +175,20 @@ describe("U9 ATDD — S11: agent_settled advances through Pi's event-safe messag
   it("registers an agent_settled handler on extension load", async () => {
     const fake = await loadExtension();
     expect(fake.hasHandler("agent_settled")).toBe(true);
+  });
+
+  it("a successful stage completion steers the next-stage kickoff", async () => {
+    const fake = await loadExtension();
+    seed(fake, "orientation", [], { pendingAdvance: false });
+
+    await driveStageDone(fake, {
+      tool_call_id: "tc-steer",
+      name: "ralph_stage_done",
+      args: { stage: "orientation" },
+    });
+
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
+    expect(fake.session.sendUserMessageCalls()[0]?.text).toContain("TOOL DISCIPLINE");
   });
 
   it("after ORIENTATION completes, agent_settled sends exactly one next-stage kickoff", async () => {
@@ -283,7 +303,7 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
    *   nextStage from the parsed queue + completed set.
    */
 
-  it("verify completion keeps currentStage at verify and sets pendingAdvance=true", async () => {
+  it("verify completion moves directly to REPORT with no pending settled advance", async () => {
     const fake = await loadExtension();
     seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
 
@@ -293,13 +313,11 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
       args: { stage: "verify" },
     });
 
-    // R7 invariant: currentStage remains at the just-completed stage when
-    // the advance leads to the terminal stage.
-    expect(fake.store.active?.currentStage).toBe("verify");
-    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(true);
+    expect(fake.store.active?.currentStage).toBe("report");
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(false);
   });
 
-  it("after verify completion, agent_settled sends exactly one REPORT kickoff", async () => {
+  it("verify completion immediately sends exactly one REPORT kickoff", async () => {
     const fake = await loadExtension();
     // Seed at verify with all prior stages completed and pendingAdvance: false.
     seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
@@ -311,9 +329,6 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
       name: "ralph_stage_done",
       args: { stage: "verify" },
     });
-
-    fake.session.calls.length = 0;
-    await fake.invokeAgentSettled({});
 
     expect(fake.session.newSessionCalls()).toHaveLength(0);
     expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
@@ -349,6 +364,14 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
       args: { stage: "verify" },
     });
     await fake.invokeAgentSettled({});
+    const kickoff = fake.session.sendUserMessageCalls()[0]?.text;
+    if (!kickoff) throw new Error("REPORT kickoff must be sent");
+    await fake.invokeBeforeAgentStart({
+      type: "before_agent_start",
+      prompt: kickoff,
+      systemPrompt: "",
+      systemPromptOptions: {},
+    });
 
     const result = await fake.invokeContext({
       messages: [
@@ -452,7 +475,7 @@ describe("U2 ATDD — pendingAdvance gate", () => {
     expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(false);
   });
 
-  it("a successful ralph_stage_done sets store.active.pendingAdvance=true", async () => {
+  it("a successful ralph_stage_done steers immediately without a pending settled advance", async () => {
     const fake = await loadExtension();
     // Seed at orientation with pendingAdvance: false — the typical pre-
     // completion steady state.
@@ -465,10 +488,8 @@ describe("U2 ATDD — pendingAdvance gate", () => {
       args: { stage: "orientation" },
     });
 
-    // The handler MUST persist pendingAdvance=true on the live state so the
-    // next agent_settled (which always follows a tool call's model turn)
-    // passes the gate and triggers a newSession.
-    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(true);
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(false);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
   });
 
   it("a failed ralph_stage_done does NOT flip pendingAdvance to true", async () => {
@@ -529,9 +550,7 @@ describe("U9 ATDD — end-to-end through tool execute", () => {
     expect(secondText).toMatch(/advanced.*execute/i);
     expect(fake.store.active?.currentStage).toBe("execute");
 
-    // Tool execution must NEVER have called any session port — the port is
-    // reserved for the agent_settled hook.
-    expect(fake.session.calls).toHaveLength(0);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(2);
   });
 });
 

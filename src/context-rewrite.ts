@@ -65,6 +65,17 @@ export function rewriteContextMessages(
     return asArray(messages as readonly AgentMessage[]);
   }
 
+  const lastStage = state.parsed.stages[state.parsed.stages.length - 1];
+  if (lastStage !== undefined && state.completedStages.has(lastStage.id)) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const raw = messages[index];
+      if (isUserMessage(raw) && getTextParts(raw.content) !== null) {
+        return [raw as AgentMessage];
+      }
+    }
+    return [];
+  }
+
   if (state.completedStages.size > 0) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const raw = messages[index];

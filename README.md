@@ -13,6 +13,21 @@ pi -e ./src/index.ts
 
 `-e` 用于显式加载 extension 入口。作为 Pi package 使用时，`package.json` 中的 `pi.extensions` 已声明 `./src/index.ts`，支持 Pi 按 package metadata 自动加载，无需重复指定 `-e`。
 
+开发机全局安装当前 checkout：
+
+```bash
+pi install /home/chaowen/Dev/agent_tools/pi-ralph-phased
+pi list
+```
+
+只在当前项目启用：
+
+```bash
+pi install -l /home/chaowen/Dev/agent_tools/pi-ralph-phased
+```
+
+安装后普通运行 `pi` 或 Ralph 的 Pi backend 即会自动加载。修改本仓库源码后不需要重新打包；如果移动了仓库目录，需要移除旧路径后重新安装。
+
 ## 阶段语义
 
 扩展识别结构完整且具有强 Ralph 信号的 activation prompt，并按以下阶段推进：
@@ -43,9 +58,24 @@ Pi 0.81.1 的 `before_agent_start` 返回值不能替换原始 `event.prompt`。
 npm run typecheck
 npm test
 ./scripts/smoke-print.sh
+npm run test:e2e
 ```
 
 烟测仅执行 `pi -e ./src/index.ts --help`，验证真实 Pi 二进制可以加载 extension，不调用模型，也不需要凭据。如果 `pi` 不在 `PATH` 中，脚本会明确报告自动跳过并以状态 0 退出；这不等同于真实 Pi 验证通过。
+
+`npm run test:e2e` 会调用真实 Pi 和真实模型，要求对应 provider 凭据。默认使用 `deepseek/deepseek-v4-flash`，也可覆盖：
+
+```bash
+PI_E2E_PROVIDER=google PI_E2E_MODEL=gemini-2.0-flash npm run test:e2e
+```
+
+通过时应输出完整顺序：
+
+```text
+orientation -> execute -> verify -> report
+```
+
+这证明扩展被加载、模型能调用 `ralph_stage_done`、阶段会自动续跑，并且 REPORT 后停止。
 
 ## 非目标与边界
 

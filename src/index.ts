@@ -111,16 +111,24 @@ function registerPiHook<E extends string>(
 
 export default function piRalphPhased(pi: ExtensionAPI): void {
   const store = new SessionStateStore();
+  let continuationPrompt: string | undefined;
 
-  registerPiHook(pi, "before_agent_start", (event) =>
-    handleBeforeAgentStart(event as BeforeAgentStartEvent, store));
+  registerPiHook(pi, "before_agent_start", (event) => {
+    const typedEvent = event as BeforeAgentStartEvent;
+    const isContinuation = typedEvent.prompt === continuationPrompt;
+    continuationPrompt = undefined;
+    return handleBeforeAgentStart(typedEvent, store, isContinuation);
+  });
 
   registerPiHook(pi, "context", (event) =>
     handleContext(event as ContextEvent, store));
 
   registerPiHook(pi, "agent_settled", (event, ctx) =>
     handleAgentSettled(event, ctx, store, {
-      sendUserMessage: (text) => pi.sendUserMessage(text),
+      sendUserMessage: (text) => {
+        continuationPrompt = text;
+        pi.sendUserMessage(text);
+      },
     }));
 
   registerPiHook(pi, "tool_call", (event, ctx) =>
@@ -134,9 +142,39 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
     execute: async (
       _toolCallId: string,
       params: RalphStageDoneParams,
+      _signal?: AbortSignal,
+      _onUpdate?: unknown,
       ctx?: unknown,
     ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> => {
-      return handleStageDone(params, store, ctx);
+      const response = await handleStageDone(params, store, ctx);
+      const transition = (response.details as {
+        transition?: { ok: boolean; advancedTo?: StageId };
+      }).transition;
+      if (transition?.ok && transition.advancedTo !== undefined && store.active !== undefined) {
+        const nextState: RalphSessionState = {
+          ...store.active,
+          currentStage: transition.advancedTo,
+          pendingAdvance: false,
+        };
+        store.set(nextState);
+        if (ctx !== null && typeof ctx === "object") {
+          const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
+          if (seededStore !== undefined && typeof seededStore.set === "function") {
+            seededStore.set(nextState);
+          }
+        }
+        await advanceAfterSettled(nextState, {
+          sendUserMessage: (text) => {
+            continuationPrompt = text;
+            pi.sendUserMessage(text, { deliverAs: "steer" });
+          },
+        }, { nextStage: transition.advancedTo });
+      } else if (transition?.ok && transition.advancedTo === undefined &&
+        store.active?.currentStage === params.stage) {
+        continuationPrompt = "All Ralph stages are complete. Do not call any tool. Reply exactly RALPH_PHASED_COMPLETE.";
+        pi.sendUserMessage(continuationPrompt, { deliverAs: "steer" });
+      }
+      return response;
     },
   } as never);
 }
@@ -144,7 +182,10 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
 async function handleBeforeAgentStart(
   event: BeforeAgentStartEvent,
   store: SessionStateStore,
+  isContinuation = false,
 ): Promise<BeforeAgentStartEventResultLike | void> {
+  if (isContinuation && store.active !== undefined) return;
+
   // U4 R8: clear the in-process store before any early return so a stale
   // activation from a previous run cannot leak into the next `context`
   // rewrite. The only state that must survive this hook is the one we
@@ -228,6 +269,21 @@ async function handleStageDone(
       const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
       if (seededStore !== undefined && typeof seededStore.set === "function") {
         seededStore.set(next);
+      }
+    }
+  } else if (result.transition.ok && result.transition.advancedTo === undefined) {
+    const completedStages = new Set(state.completedStages);
+    completedStages.add(state.currentStage);
+    const completedState: RalphSessionState = {
+      ...state,
+      completedStages,
+      pendingAdvance: false,
+    };
+    store.set(completedState);
+    if (ctx !== null && typeof ctx === "object") {
+      const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
+      if (seededStore !== undefined && typeof seededStore.set === "function") {
+        seededStore.set(completedState);
       }
     }
   }

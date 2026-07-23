@@ -8,6 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 项目边界是需求 B（分阶段执行）。需求 A（Ralph 默认少加载全局 skill）属于 `ralph-orchestrator`，不在本仓库实现。
 
+## 协作硬规则
+
+- 提交代码时必须保持当前分支直接提交。
+- 未经用户明确授权，绝不创建、切换或建议功能分支。
+- 即使某个 skill 或工作流默认要求新建分支，也必须以本规则为准；如确有冲突，先暂停并询问用户。
+
 ## 常用命令
 
 需要 Node.js `>=22.19.0`。

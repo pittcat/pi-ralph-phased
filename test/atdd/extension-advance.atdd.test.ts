@@ -204,9 +204,13 @@ describe("U9 ATDD — S11: agent_settled advances the session via newSession", (
 });
 
 describe("U9 ATDD — S12: terminal-stage completion does NOT invoke newSession", () => {
-  it("does NOT call newSession when currentStage is the actual last stage (REPORT)", async () => {
+  it("does NOT call newSession when currentStage is the actual last stage (REPORT) and pendingAdvance is false", async () => {
     const fake = await loadExtension();
-    seed(fake, "report", ["orientation", "tool_discipline", "execute", "verify"]);
+    // R7 widening: the "REPORT in flight" steady state has currentStage at
+    // the terminal stage AND pendingAdvance === false (no stage_done has
+    // just been called). The U2 gate short-circuits before any port
+    // method runs.
+    seed(fake, "report", ["orientation", "tool_discipline", "execute", "verify"], { pendingAdvance: false });
     fake.session.calls.length = 0;
 
     await fake.invokeAgentSettled({});
@@ -221,6 +225,124 @@ describe("U9 ATDD — S12: terminal-stage completion does NOT invoke newSession"
     fake.session.calls.length = 0;
     await fake.invokeAgentSettled({});
     expect(fake.session.newSessionCalls()).toHaveLength(0);
+  });
+});
+
+describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
+  /**
+   * R7 contract:
+   *   When the last non-terminal stage (verify) completes via ralph_stage_done:
+   *     - The session state persists with currentStage STILL at "verify"
+   *       (NOT advanced to "report").
+   *     - pendingAdvance is set to a shaped truthy value (boolean true per the
+   *       current type contract).
+   *     - agent_settled invokes newSession exactly once with a kickoff that
+   *       contains the terminal stage ("REPORT").
+   *     - After the advance, store.active is cleared (cleared, not just a
+   *       pendingAdvance flip).
+   *     - A subsequent agent_settled is a no-op (because store.active is gone).
+   *
+   *   The previous S12 "currentStage=report + pendingAdvance true → no-op"
+   *   semantic was wrong: it prematurely short-circuited the terminal
+   *   advance and prevented the terminal stage from ever running in a fresh
+   *   session. R7 fixes that by keeping currentStage at the just-completed
+   *   non-terminal stage and letting handleAgentSettled compute the terminal
+   *   nextStage from the parsed queue + completed set.
+   */
+
+  it("verify completion keeps currentStage at verify and sets pendingAdvance=true", async () => {
+    const fake = await loadExtension();
+    seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
+
+    await driveStageDone(fake, {
+      tool_call_id: "tc-verify-1",
+      name: "ralph_stage_done",
+      args: { stage: "verify" },
+    });
+
+    // R7 invariant: currentStage remains at the just-completed stage when
+    // the advance leads to the terminal stage.
+    expect(fake.store.active?.currentStage).toBe("verify");
+    expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(true);
+  });
+
+  it("after verify completion, agent_settled invokes newSession exactly once with REPORT kickoff", async () => {
+    const fake = await loadExtension();
+    // Seed at verify with all prior stages completed and pendingAdvance: false.
+    seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
+
+    // Drive verify completion through the wired tool handler so applyTransition
+    // produces the R7-shaped state.
+    await driveStageDone(fake, {
+      tool_call_id: "tc-verify-1",
+      name: "ralph_stage_done",
+      args: { stage: "verify" },
+    });
+
+    fake.session.calls.length = 0;
+    await fake.invokeAgentSettled({});
+
+    expect(fake.session.newSessionCalls()).toHaveLength(1);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(0);
+    const kickoff = fake.session.newSessionCalls()[0]?.kickoff ?? "";
+    expect(kickoff).toContain("REPORT");
+  });
+
+  it("agent_settled clears store.active after firing the terminal advance", async () => {
+    const fake = await loadExtension();
+    seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
+
+    await driveStageDone(fake, {
+      tool_call_id: "tc-verify-1",
+      name: "ralph_stage_done",
+      args: { stage: "verify" },
+    });
+
+    expect(fake.store.active).toBeDefined();
+
+    await fake.invokeAgentSettled({});
+
+    expect(fake.store.active).toBeUndefined();
+  });
+
+  it("a second agent_settled after the terminal advance is a no-op", async () => {
+    const fake = await loadExtension();
+    seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
+
+    await driveStageDone(fake, {
+      tool_call_id: "tc-verify-1",
+      name: "ralph_stage_done",
+      args: { stage: "verify" },
+    });
+
+    // First settle: fires the terminal newSession and clears store.active.
+    await fake.invokeAgentSettled({});
+    expect(fake.session.newSessionCalls()).toHaveLength(1);
+
+    // Second settle: store.active is undefined → must be a complete no-op.
+    fake.session.calls.length = 0;
+    await fake.invokeAgentSettled({});
+    expect(fake.session.newSessionCalls()).toHaveLength(0);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(0);
+    expect(fake.session.waitForIdleCalls()).toHaveLength(0);
+  });
+
+  it("terminal currentStage=report with pendingAdvance=false is a complete no-op preserving store.active", async () => {
+    const fake = await loadExtension();
+    // Pre-existing terminal state — model never marked REPORT done, no
+    // pending advance. This is the "REPORT in flight" steady-state.
+    seed(fake, "report", ["orientation", "tool_discipline", "execute", "verify"], { pendingAdvance: false });
+
+    const snapshot = fake.store.active;
+    fake.session.calls.length = 0;
+    await fake.invokeAgentSettled({});
+
+    expect(fake.session.newSessionCalls()).toHaveLength(0);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(0);
+    expect(fake.session.waitForIdleCalls()).toHaveLength(0);
+    // R7: store.active MUST be preserved (the gate short-circuits; we do
+    // NOT clear on the no-op path).
+    expect(fake.store.active).toBe(snapshot);
   });
 });
 

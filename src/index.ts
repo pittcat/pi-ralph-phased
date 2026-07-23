@@ -240,12 +240,47 @@ function applyTransition(
   if (transition.advancedTo === undefined) return undefined;
   const completed = new Set(state.completedStages);
   completed.add(state.currentStage);
+  // U3 R7: when the advance leads to the actual last stage in the parsed
+  // queue, keep `currentStage` at the just-completed non-terminal stage so
+  // `agent_settled` can pair the just-completed stage with the terminal
+  // `nextStage` and fire exactly one terminal `newSession` whose kickoff
+  // carries the REPORT short contract. The shape stored here is the R7
+  // "刚完成阶段 + terminal nextStage" pair the seam relies on.
+  const lastStage = state.parsed.stages[state.parsed.stages.length - 1];
+  const isTerminalAdvance =
+    lastStage !== undefined && lastStage.id === transition.advancedTo;
   return {
     ...state,
-    currentStage: transition.advancedTo,
+    ...(isTerminalAdvance
+      ? {}
+      : { currentStage: transition.advancedTo }),
     completedStages: completed,
     pendingAdvance: true,
   };
+}
+
+/**
+ * U3 R7 — derive the next stage to advance into, given the live state.
+ *
+ * After a `ralph_stage_done` advance, `state.currentStage` is either:
+ *   - the post-advance stage (when the advance was non-terminal), or
+ *   - the just-completed non-terminal stage (when the advance was terminal,
+ *     per the R7 widening in {@link applyTransition}).
+ *
+ * `agent_settled` needs the "next stage" to forward to
+ * `advanceAfterSettled` so the seam can build the right kickoff. We compute
+ * it by scanning the parsed queue and returning the first stage whose id
+ * is NOT in the completed set; that stage is exactly the one that will
+ * run in the new session.
+ *
+ * Returns `undefined` if every parsed stage has been completed (in which
+ * case `agent_settled` must be a no-op — nothing to advance into).
+ */
+function deriveNextStage(state: RalphSessionState): StageId | undefined {
+  for (const stage of state.parsed.stages) {
+    if (!state.completedStages.has(stage.id)) return stage.id;
+  }
+  return undefined;
 }
 
 /**
@@ -260,10 +295,11 @@ function applyTransition(
  *
  * U2 gate: `agent_settled` is a no-op unless `state.pendingAdvance === true`.
  * The gate is set by `handleStageDone` (which flips it to `true` on a legal
- * advance) and cleared by `advanceAfterSettled` after a successful non-
- * terminal advance. This ensures `newSession` is only called on turns where
- * the model actually completed a stage; ordinary end-of-turn idle events do
- * not trigger a session reset.
+ * advance). U3 R7 widens the post-advance side: after the seam fires
+ * successfully we call `store.clear()` so a follow-up `agent_settled` (e.g.
+ * a stray idle event right after the new session started) is a complete
+ * no-op. The terminal-stage clear also guarantees we never re-fire
+ * `newSession` against a state that already ran its terminal advance.
  *
  * The Pi 0.81.1 `ExtensionContext` typed for `agent_settled` does NOT expose
  * `newSession`, `sendUserMessage`, or `waitForIdle` (those appear only on
@@ -284,14 +320,44 @@ async function handleAgentSettled(
   // session.
   if (state.pendingAdvance !== true) return;
 
+  // U3 R7: derive the next stage from the parsed queue + completed set so
+  // we can forward it to `advanceAfterSettled` via `input.nextStage`. The
+  // terminal-stage widening in `applyTransition` (keep currentStage at
+  // verify, do NOT advance to report) means state.currentStage alone is
+  // not enough to identify the kickoff target when the last advance was
+  // terminal. Scanning the queue + completed set is the single source of
+  // truth for "what runs in the new session next".
+  const nextStage = deriveNextStage(state);
+  if (nextStage === undefined) {
+    // Every parsed stage is already completed — nothing to advance into.
+    // Treat this as a fully settled state: clear the store and bail out.
+    store.clear();
+    if (ctx !== null && typeof ctx === "object") {
+      const seededStore = (ctx as { store?: { clear?: () => void } }).store;
+      if (seededStore !== undefined && typeof seededStore.clear === "function") {
+        seededStore.clear();
+      }
+    }
+    return;
+  }
+
   const port = ctx as SessionAdvancePort;
-  await advanceAfterSettled(state, port);
-  const next = { ...state, pendingAdvance: false };
-  store.set(next);
+  await advanceAfterSettled(state, port, { nextStage });
+  // U3 R7: after a successful advance, clear the live session state. The
+  // store being empty is what makes the second `agent_settled` no-op, and
+  // it also keeps the in-memory map tidy once a full Ralph run has been
+  // completed end-to-end (REPORT in flight → store cleared).
+  store.clear();
   if (ctx !== null && typeof ctx === "object") {
-    const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
-    if (seededStore !== undefined && typeof seededStore.set === "function") {
-      seededStore.set(next);
+    // The Fake test store exposes `set` (no `clear`); clear it via the
+    // same seam by setting `undefined`, which the Fake accepts.
+    const seededStore = (ctx as { store?: { set?: (s: RalphSessionState | undefined) => void; clear?: () => void } }).store;
+    if (seededStore !== undefined) {
+      if (typeof seededStore.clear === "function") {
+        seededStore.clear();
+      } else if (typeof seededStore.set === "function") {
+        seededStore.set(undefined);
+      }
     }
   }
 }

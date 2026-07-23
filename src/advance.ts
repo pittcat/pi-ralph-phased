@@ -116,11 +116,37 @@ function resolveNextStage(
 }
 
 /**
- * Host-independent orchestration seam for U9.
+ * U3 R7 — should the seam advance at all?
+ *
+ * Two regimes:
+ *  1. Explicit `nextStage` was provided by the caller (the U3 R7
+ *     `handleAgentSettled` path that read the parsed queue + completed
+ *     set to derive the post-completion next stage). The caller has a
+ *     fresher answer than the cached `state.currentStage`, so we trust
+ *     it: advance even when the value happens to be the terminal stage
+ *     (this is what fires the REPORT kickoff in a fresh session).
+ *  2. No explicit `nextStage` — fall back to `state.currentStage`. When
+ *     that already IS the terminal stage, the previous U9 S12 path was
+ *     supposed to be a no-op. That stays: do not fire a stray
+ *     `newSession` after a steady-state idle on the terminal stage.
+ *
+ * The non-explicit `state.currentStage` fallback is what the U9 unit
+ * tests drive (e.g. `makeState({ advancedTo: "report" })`), so it must
+ * stay short-circuiting at terminal; R7 does NOT widen that fallback.
+ */
+function shouldAdvance(
+  state: RalphSessionState,
+  nextStage: StageId | undefined,
+): boolean {
+  if (nextStage !== undefined) return true;
+  return !isTerminal(state.currentStage, state.parsed);
+}
+
+/**
+ * Host-independent orchestration seam for U9 + U3 R7.
  *
  * U9 contract:
- *  - When `nextStage` (or the fallback `state.currentStage`) is NOT the
- *    actual last stage in `state.parsed.stages`, this function:
+ *  - When the seam decides to advance (see {@link shouldAdvance}):
  *      1. Awaits `port.waitForIdle?.()` if the port exposes it
  *         (skipping silently otherwise).
  *      2. Computes a kickoff via `buildStageUserMessage` plus a derived
@@ -128,10 +154,20 @@ function resolveNextStage(
  *         `port.newSession({ kickoff })`.
  *      3. Does NOT call `port.sendUserMessage` (sending a message would
  *         only stack history — the whole point of U9 is to RESET context).
- *  - When the resolved stage IS the actual last stage, this function
- *    returns immediately without invoking ANY port method.
+ *  - When the seam decides to no-op, it returns immediately without
+ *    invoking ANY port method.
  *  - Every call is `await`ed end-to-end so the surrounding harness can be
  *    sure the side-effect completed (print-mode dispose safety).
+ *
+ * U3 R7 widening: the seam is now neutral about the terminal-stage
+ * `state.currentStage` short-circuit. The caller (U3 R7
+ * `handleAgentSettled`) is responsible for telling the seam the
+ * post-completion `nextStage` via `input.nextStage` whenever the live
+ * state still has the just-completed non-terminal stage as
+ * `currentStage`. When `input.nextStage` is the terminal stage, the
+ * seam still advances (kickoff = REPORT short contract) — that is the
+ * R7 contract that makes the terminal stage actually run in a fresh
+ * session.
  */
 export async function advanceAfterSettled(
   state: RalphSessionState,
@@ -139,9 +175,10 @@ export async function advanceAfterSettled(
   input: SessionAdvanceInput = {},
 ): Promise<void> {
   const nextStage = resolveNextStage(state, input.nextStage);
-  if (isTerminal(nextStage, state.parsed)) {
-    // S12: terminal stage — no advance, no push. Completion surfaces through
-    // `state.isComplete` (see `src/stage-machine.ts`).
+  if (!shouldAdvance(state, input.nextStage)) {
+    // S12 / R7 no-op: the cached currentStage is already the terminal
+    // stage and the caller did not provide a fresher nextStage. Stay
+    // idle; do NOT touch the session port.
     return;
   }
 

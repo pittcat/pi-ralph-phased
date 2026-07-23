@@ -153,6 +153,24 @@ describe("rewriteContextMessages — takeover (state provided)", () => {
     expect(result[1]).toEqual(second);
   });
 
+  it("drops prior-stage history after a stage completes", () => {
+    const state: RalphSessionState = {
+      ...loadState("execute"),
+      completedStages: new Set<StageId>(["orientation", "tool_discipline"]),
+    };
+    const messages = [
+      userMessage(STANDARD_RALPH),
+      { role: "assistant", content: [{ type: "text", text: "old stage trace" }] },
+      userMessage("next-stage kickoff"),
+    ];
+
+    const result = rewriteContextMessages(messages, state) as unknown as FakeUserMessage[];
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.content[0]!.text).toContain("EXECUTE");
+    expect(JSON.stringify(result)).not.toContain("old stage trace");
+  });
+
   it("does not mutate the input messages array when rewriting", () => {
     const messages: FakeUserMessage[] = [userMessage(STANDARD_RALPH)];
     const snapshot = JSON.parse(JSON.stringify(messages)) as FakeUserMessage[];

@@ -54,10 +54,8 @@ interface ContextEventResultLike {
  *   as a direct dependency. Pi's `ToolDefinition.parameters` is typed
  *   `TSchema`; passing an object that conforms to that shape works at the
  *   Pi runtime boundary — U11 will replace this with the official helper.
- * - U9 (agent_settled, newSession, sendUserMessage, waitForIdle) is now
- *   registered below — `agent_settled` calls `advanceAfterSettled` which
- *   only reads `waitForIdle?/newSession/sendUserMessage?` off the host
- *   context (Fake or real Pi).
+ * - U9 uses ExtensionAPI.sendUserMessage from `agent_settled`; the next
+ *   context rewrite removes prior-stage history before provider dispatch.
  * - U10 (tool_call emit guard) — also registered below. It only listens to
  *   the `bash` (and `shell` alias) tool, derives `stageIsLast` /
  *   `command` / `publishTopics` from the in-memory session state, and
@@ -121,7 +119,9 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
     handleContext(event as ContextEvent, store));
 
   registerPiHook(pi, "agent_settled", (event, ctx) =>
-    handleAgentSettled(event, ctx, store));
+    handleAgentSettled(event, ctx, store, {
+      sendUserMessage: (text) => pi.sendUserMessage(text),
+    }));
 
   registerPiHook(pi, "tool_call", (event, ctx) =>
     handleToolCall(event, ctx, store));
@@ -294,29 +294,23 @@ function deriveNextStage(state: RalphSessionState): StageId | undefined {
  *
  * After every model turn, Pi delivers an `agent_settled` event. We translate
  * that into an awaited host session-port call so the next stage begins in a
- * fresh session — the only mechanism that actually resets Pi's accumulated
- * --no-session history. Sending another user message here would merely stack
- * tokens; the plan and S11 explicitly forbid that. S12 forbids advancing on
- * the actual last stage.
+ * isolated model context. Pi 0.81.1 does not expose session-control methods
+ * on event contexts, so the extension triggers the next turn through
+ * ExtensionAPI.sendUserMessage and lets the context hook remove old history.
  *
- * U2 gate: `agent_settled` is a no-op unless `state.pendingAdvance === true`.
- * The gate is set by `handleStageDone` (which flips it to `true` on a legal
- * advance). U3 R7 widens the post-advance side: after the seam fires
- * successfully we call `store.clear()` so a follow-up `agent_settled` (e.g.
- * a stray idle event right after the new session started) is a complete
- * no-op. The terminal-stage clear also guarantees we never re-fire
- * `newSession` against a state that already ran its terminal advance.
+ * `agent_settled` is a no-op unless `state.pendingAdvance === true`. Before
+ * sending the kickoff we store the resolved next stage with the pending flag
+ * cleared, so a later settled event cannot duplicate the continuation.
  *
- * The Pi 0.81.1 `ExtensionContext` typed for `agent_settled` does NOT expose
- * `newSession`, `sendUserMessage`, or `waitForIdle` (those appear only on
- * `ExtensionCommandContext`). Until a runtime spike proves the surface in the
- * real handler — see docs/SCAFFOLD_DECISIONS.md item 1 — we cast through
- * `unknown`. The Fake's FakeAgentSettledContext satisfies the same shape.
+ * The Pi 0.81.1 `ExtensionContext` typed for `agent_settled` does not expose
+ * session-control methods. This handler therefore never casts it to a command
+ * context.
  */
 async function handleAgentSettled(
   _event: unknown,
   ctx: unknown,
   store: SessionStateStore,
+  port: SessionAdvancePort,
 ): Promise<void> {
   const state = store.active ?? readSeededState(ctx);
   if (state === undefined) return;
@@ -347,23 +341,17 @@ async function handleAgentSettled(
     return;
   }
 
-  const port = ctx as SessionAdvancePort;
+  const settledState: RalphSessionState = {
+    ...state,
+    currentStage: nextStage,
+    pendingAdvance: false,
+  };
+  store.set(settledState);
   await advanceAfterSettled(state, port, { nextStage });
-  // U3 R7: after a successful advance, clear the live session state. The
-  // store being empty is what makes the second `agent_settled` no-op, and
-  // it also keeps the in-memory map tidy once a full Ralph run has been
-  // completed end-to-end (REPORT in flight → store cleared).
-  store.clear();
   if (ctx !== null && typeof ctx === "object") {
-    // The Fake test store exposes `set` (no `clear`); clear it via the
-    // same seam by setting `undefined`, which the Fake accepts.
-    const seededStore = (ctx as { store?: { set?: (s: RalphSessionState | undefined) => void; clear?: () => void } }).store;
-    if (seededStore !== undefined) {
-      if (typeof seededStore.clear === "function") {
-        seededStore.clear();
-      } else if (typeof seededStore.set === "function") {
-        seededStore.set(undefined);
-      }
+    const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
+    if (seededStore !== undefined && typeof seededStore.set === "function") {
+      seededStore.set(settledState);
     }
   }
 }

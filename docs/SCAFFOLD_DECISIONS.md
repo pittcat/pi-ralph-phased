@@ -17,13 +17,11 @@ It does **not** claim that plan scenarios S1–S15 are implemented.
 
 ## Unresolved implementation decisions
 
-1. **`agent_settled` cannot type-safely call `newSession` on Pi 0.81.1.**
-   The installed declarations type event handlers with `ExtensionContext`;
-   `newSession`, `waitForIdle`, and `sendUserMessage` exist only on
-   `ExtensionCommandContext`. Before U9, run a focused runtime spike and consult
-   the matching Pi source/docs. If the runtime also lacks these methods, the
-   plan needs an officially supported continuation mechanism; do not cast the
-   context merely to silence TypeScript.
+1. **Resolved: `agent_settled` does not call `newSession` on Pi 0.81.1.**
+   Event handlers receive `ExtensionContext`, so stage continuation uses the
+   event-safe `ExtensionAPI.sendUserMessage`. The `context` hook returns only
+   the current stage kickoff after a stage completes, preventing prior-stage
+   history from reaching the model without an unsafe context cast.
 2. **Deferred skill delivery in EXECUTE:** inline the extracted XML (plan
    recommendation) or require a file read. Recommendation: inline it because it
    is execution-critical and avoids reliance on model tool compliance. U3 tests

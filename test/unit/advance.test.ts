@@ -58,8 +58,7 @@ describe("U9 — renderHandoffBrief truncation policy", () => {
  * U9 acceptance — advanceAfterSettled port contract.
  *
  * The orchestration seam must:
- *  - Call `waitForIdle()` first when the port provides it, and await it.
- *  - Then call `newSession({ kickoff })` exactly once when the machine has
+ *  - Call `sendUserMessage(kickoff)` exactly once when the machine has
  *    advanced to a next stage that is not the actual last stage.
  *  - Skip both calls when the stage machine is at the actual last stage
  *    (i.e. the previously completed stage was the terminal one).
@@ -67,47 +66,24 @@ describe("U9 — renderHandoffBrief truncation policy", () => {
  *    without races between successive calls.
  */
 describe("U9 — advanceAfterSettled call sequence on advance", () => {
-  it("calls newSession exactly once with a kickoff derived from the next stage", async () => {
+  it("calls sendUserMessage exactly once with a kickoff derived from the next stage", async () => {
     const state = makeState({ advancedTo: "tool_discipline" });
     const port = makeRecordingPort();
 
     await advanceAfterSettled(state, port);
 
-    expect(port.newSessionCalls).toHaveLength(1);
-    const kickoff = port.newSessionCalls[0]?.kickoff ?? "";
+    expect(port.sendUserMessageCalls).toHaveLength(1);
+    const kickoff = port.sendUserMessageCalls[0]?.text ?? "";
     expect(kickoff).toContain("TOOL DISCIPLINE");
     expect(kickoff).toContain(state.fullPromptPath);
   });
 
-  it("awaits waitForIdle before invoking newSession when the port exposes it", async () => {
-    const state = makeState({ advancedTo: "execute" });
-    const port = makeRecordingPort();
-
-    const order: string[] = [];
-    port.waitForIdle = async () => {
-      order.push("wait");
-    };
-    const originalNewSession = port.newSession.bind(port);
-    port.newSession = async (options) => {
-      order.push("newSession");
-      await originalNewSession(options);
-    };
-
-    await advanceAfterSettled(state, port);
-
-    expect(order).toEqual(["wait", "newSession"]);
-  });
-
-  it("skips the waitForIdle call when the port does not expose it", async () => {
+  it("does not require command-context session methods", async () => {
     const state = makeState({ advancedTo: "verify" });
     const port = makeRecordingPort();
-    delete (port as { waitForIdle?: unknown }).waitForIdle;
-
     await advanceAfterSettled(state, port);
 
-    expect(port.newSessionCalls).toHaveLength(1);
-    expect(port.sendUserMessageCalls).toHaveLength(0);
-    expect(port.waitForIdleCalls).toEqual(0);
+    expect(port.sendUserMessageCalls).toHaveLength(1);
   });
 
   it("records call order across multiple successive advance calls", async () => {
@@ -117,7 +93,7 @@ describe("U9 — advanceAfterSettled call sequence on advance", () => {
     await advanceAfterSettled(makeState({ advancedTo: "execute" }), port);
     await advanceAfterSettled(makeState({ advancedTo: "verify" }), port);
 
-    expect(port.newSessionCalls).toHaveLength(3);
+    expect(port.sendUserMessageCalls).toHaveLength(3);
   });
 
   it("includes a derived handoff brief in the kickoff message", async () => {
@@ -126,7 +102,7 @@ describe("U9 — advanceAfterSettled call sequence on advance", () => {
 
     await advanceAfterSettled(state, port);
 
-    const kickoff = port.newSessionCalls[0]?.kickoff ?? "";
+    const kickoff = port.sendUserMessageCalls[0]?.text ?? "";
     expect(kickoff).toContain("HANDOFF");
   });
 
@@ -136,21 +112,19 @@ describe("U9 — advanceAfterSettled call sequence on advance", () => {
 
     await advanceAfterSettled(state, port);
 
-    const kickoff = port.newSessionCalls[0]?.kickoff ?? "";
+    const kickoff = port.sendUserMessageCalls[0]?.text ?? "";
     expect(kickoff).not.toMatch(/tool_call_id|tool_result|function_call/);
   });
 });
 
 describe("U9 — advanceAfterSettled terminal (S12)", () => {
-  it("does NOT call newSession when the current stage is the last in the queue", async () => {
+  it("does NOT send a kickoff when the current stage is the last in the queue", async () => {
     const state = makeState({ advancedTo: "report" });
     const port = makeRecordingPort();
 
     await advanceAfterSettled(state, port);
 
-    expect(port.newSessionCalls).toHaveLength(0);
     expect(port.sendUserMessageCalls).toHaveLength(0);
-    expect(port.waitForIdleCalls).toEqual(0);
   });
 
   it("does NOT call sendUserMessage on the terminal path even if the port exposes it", async () => {
@@ -162,14 +136,6 @@ describe("U9 — advanceAfterSettled terminal (S12)", () => {
     expect(port.sendUserMessageCalls).toHaveLength(0);
   });
 
-  it("does NOT await waitForIdle on the terminal path", async () => {
-    const state = makeState({ advancedTo: "report" });
-    const port = makeRecordingPort();
-
-    await advanceAfterSettled(state, port);
-
-    expect(port.waitForIdleCalls).toEqual(0);
-  });
 });
 
 /**
@@ -177,31 +143,18 @@ describe("U9 — advanceAfterSettled terminal (S12)", () => {
  */
 
 interface RecordingPort {
-  waitForIdle?(): Promise<void>;
-  newSession(options: { kickoff: string }): Promise<void>;
-  sendUserMessage?(text: string): Promise<void>;
-  newSessionCalls: Array<{ record: string; kickoff: string }>;
+  sendUserMessage(text: string): Promise<void>;
   sendUserMessageCalls: Array<{ record: string; text: string }>;
-  waitForIdleCalls: number;
 }
 
 function makeRecordingPort(): RecordingPort {
   let counter = 0;
   const port: RecordingPort = {
-    newSessionCalls: [],
     sendUserMessageCalls: [],
-    waitForIdleCalls: 0,
-    newSession: async (options) => {
+    sendUserMessage: async (text) => {
       counter += 1;
-      port.newSessionCalls.push({ record: counter.toString(), kickoff: options.kickoff });
+      port.sendUserMessageCalls.push({ record: counter.toString(), text });
     },
-  };
-  port.waitForIdle = async () => {
-    port.waitForIdleCalls += 1;
-  };
-  port.sendUserMessage = async (text) => {
-    counter += 1;
-    port.sendUserMessageCalls.push({ record: counter.toString(), text });
   };
   return port;
 }

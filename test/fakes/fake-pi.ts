@@ -206,6 +206,10 @@ export class FakeExtensionAPI {
     this.#tools.push({ name: definition.name, definition });
   }
 
+  sendUserMessage(text: string): void {
+    void this.session.sendUserMessage(text);
+  }
+
   hasHandler(
     event: "before_agent_start" | "context" | "agent_settled" | "tool_call",
   ): boolean {

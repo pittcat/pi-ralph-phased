@@ -49,7 +49,9 @@ function buildRewriteContent(state: RalphSessionState): ContentPart[] {
  *
  * Pass-through (no state) returns a shallow copy of the input. Takeover
  * replaces the FIRST user message's text with the stage's short contract.
- * Messages that follow are preserved verbatim.
+ * After at least one stage completed, prior-stage history is discarded and
+ * only the current kickoff is returned. This is the event-safe equivalent of
+ * a session reset on Pi 0.81.1, whose event context cannot call newSession.
  *
  * The function accepts `readonly unknown[]` so callers (and tests) can pass
  * Pi-shaped or simplified user messages without TS gymnastics; the runtime
@@ -61,6 +63,19 @@ export function rewriteContextMessages(
 ): AgentMessage[] {
   if (state === undefined) {
     return asArray(messages as readonly AgentMessage[]);
+  }
+
+  if (state.completedStages.size > 0) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const raw = messages[index];
+      if (isUserMessage(raw) && getTextParts(raw.content) !== null) {
+        return [{
+          ...(raw as object),
+          content: buildRewriteContent(state),
+        } as AgentMessage];
+      }
+    }
+    return [];
   }
 
   const result: AgentMessage[] = [];

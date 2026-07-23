@@ -165,13 +165,13 @@ function seed(
   fake.store.set(seeded);
 }
 
-describe("U9 ATDD — S11: agent_settled advances the session via newSession", () => {
+describe("U9 ATDD — S11: agent_settled advances through Pi's event-safe message API", () => {
   it("registers an agent_settled handler on extension load", async () => {
     const fake = await loadExtension();
     expect(fake.hasHandler("agent_settled")).toBe(true);
   });
 
-  it("after ORIENTATION completes, agent_settled calls newSession exactly once with the next stage's kickoff", async () => {
+  it("after ORIENTATION completes, agent_settled sends exactly one next-stage kickoff", async () => {
     const fake = await loadExtension();
     // After ORIENTATION done: currentStage="tool_discipline", completed={orientation}.
     seed(fake, "tool_discipline", ["orientation"]);
@@ -182,24 +182,22 @@ describe("U9 ATDD — S11: agent_settled advances the session via newSession", (
 
     await fake.invokeAgentSettled({});
 
-    expect(session.newSessionCalls()).toHaveLength(1);
-    expect(session.sendUserMessageCalls()).toHaveLength(0);
+    expect(session.newSessionCalls()).toHaveLength(0);
+    expect(session.sendUserMessageCalls()).toHaveLength(1);
 
-    const kickoff = session.newSessionCalls()[0]?.kickoff ?? "";
+    const kickoff = session.sendUserMessageCalls()[0]?.text ?? "";
     expect(kickoff).toContain("TOOL DISCIPLINE");
     expect(kickoff).toContain(FULL_PROMPT_PATH);
     expect(kickoff).toContain("ralph_stage_done");
   });
 
-  it("awaits waitForIdle before invoking newSession when the context exposes it", async () => {
+  it("does not depend on command-context-only waitForIdle/newSession methods", async () => {
     const fake = await loadExtension();
     seed(fake, "execute", ["orientation", "tool_discipline"]);
     fake.session.calls.length = 0;
     await fake.invokeAgentSettled({});
 
-    const calls = fake.session.calls.map((c) => c.kind);
-    expect(calls[0]).toBe("waitForIdle");
-    expect(calls[calls.length - 1]).toBe("newSession");
+    expect(fake.session.calls.map((c) => c.kind)).toEqual(["sendUserMessage"]);
   });
 
   it("the new kickoff does not contain the previous stage's tool_call trace", async () => {
@@ -209,22 +207,20 @@ describe("U9 ATDD — S11: agent_settled advances the session via newSession", (
     fake.session.calls.length = 0;
     await fake.invokeAgentSettled({});
 
-    const kickoff = fake.session.newSessionCalls()[0]?.kickoff ?? "";
+    const kickoff = fake.session.sendUserMessageCalls()[0]?.text ?? "";
     expect(kickoff).not.toMatch(/tool_call_id|tool_result|function_call/);
   });
 
-  it("successive advances record call order: waitForIdle then newSession on each call", async () => {
+  it("each settled advance sends one kickoff", async () => {
     const fake = await loadExtension();
     seed(fake, "tool_discipline", ["orientation"]);
     fake.session.calls.length = 0;
 
     await fake.invokeAgentSettled({});
 
-    expect(fake.session.newSessionCalls()).toHaveLength(1);
-    const firstKickoff = fake.session.newSessionCalls()[0]?.kickoff ?? "";
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
+    const firstKickoff = fake.session.sendUserMessageCalls()[0]?.text ?? "";
     expect(firstKickoff).toContain("TOOL DISCIPLINE");
-    expect(fake.session.calls[0]?.kind).toBe("waitForIdle");
-    expect(fake.session.calls[fake.session.calls.length - 1]?.kind).toBe("newSession");
   });
 
   it("after EXECUTE done, advance produces the VERIFY kickoff", async () => {
@@ -234,8 +230,8 @@ describe("U9 ATDD — S11: agent_settled advances the session via newSession", (
 
     await fake.invokeAgentSettled({});
 
-    expect(fake.session.newSessionCalls()).toHaveLength(1);
-    const kickoff = fake.session.newSessionCalls()[0]?.kickoff ?? "";
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
+    const kickoff = fake.session.sendUserMessageCalls()[0]?.text ?? "";
     expect(kickoff).toContain("VERIFY");
   });
 });
@@ -303,7 +299,7 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
     expect((fake.store.active as unknown as RalphSessionState | undefined)?.pendingAdvance).toBe(true);
   });
 
-  it("after verify completion, agent_settled invokes newSession exactly once with REPORT kickoff", async () => {
+  it("after verify completion, agent_settled sends exactly one REPORT kickoff", async () => {
     const fake = await loadExtension();
     // Seed at verify with all prior stages completed and pendingAdvance: false.
     seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
@@ -319,13 +315,13 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
     fake.session.calls.length = 0;
     await fake.invokeAgentSettled({});
 
-    expect(fake.session.newSessionCalls()).toHaveLength(1);
-    expect(fake.session.sendUserMessageCalls()).toHaveLength(0);
-    const kickoff = fake.session.newSessionCalls()[0]?.kickoff ?? "";
+    expect(fake.session.newSessionCalls()).toHaveLength(0);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
+    const kickoff = fake.session.sendUserMessageCalls()[0]?.text ?? "";
     expect(kickoff).toContain("REPORT");
   });
 
-  it("agent_settled clears store.active after firing the terminal advance", async () => {
+  it("agent_settled keeps terminal state and clears the pending flag", async () => {
     const fake = await loadExtension();
     seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
 
@@ -339,7 +335,32 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
 
     await fake.invokeAgentSettled({});
 
-    expect(fake.store.active).toBeUndefined();
+    expect(fake.store.active).toBeDefined();
+    expect((fake.store.active as unknown as RalphSessionState).pendingAdvance).toBe(false);
+    expect(fake.store.active?.currentStage).toBe("report");
+  });
+
+  it("the REPORT turn context contains no prior-stage history", async () => {
+    const fake = await loadExtension();
+    seed(fake, "verify", ["orientation", "tool_discipline", "execute"], { pendingAdvance: false });
+    await driveStageDone(fake, {
+      tool_call_id: "tc-verify-context",
+      name: "ralph_stage_done",
+      args: { stage: "verify" },
+    });
+    await fake.invokeAgentSettled({});
+
+    const result = await fake.invokeContext({
+      messages: [
+        { role: "user", content: [{ type: "text", text: STANDARD_RALPH }] },
+        { role: "assistant", content: [{ type: "text", text: "old verify trace" }] },
+        { role: "user", content: [{ type: "text", text: "report kickoff" }] },
+      ],
+    }) as { messages: Array<{ content: Array<{ text: string }> }> };
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.content[0]!.text).toContain("REPORT");
+    expect(JSON.stringify(result.messages)).not.toContain("old verify trace");
   });
 
   it("a second agent_settled after the terminal advance is a no-op", async () => {
@@ -352,11 +373,11 @@ describe("U3 R7 ATDD — terminal-stage advance via newSession", () => {
       args: { stage: "verify" },
     });
 
-    // First settle: fires the terminal newSession and clears store.active.
+    // First settle: sends the terminal kickoff and clears pendingAdvance.
     await fake.invokeAgentSettled({});
-    expect(fake.session.newSessionCalls()).toHaveLength(1);
+    expect(fake.session.sendUserMessageCalls()).toHaveLength(1);
 
-    // Second settle: store.active is undefined → must be a complete no-op.
+    // Second settle: pendingAdvance is false → must be a complete no-op.
     fake.session.calls.length = 0;
     await fake.invokeAgentSettled({});
     expect(fake.session.newSessionCalls()).toHaveLength(0);

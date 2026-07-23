@@ -17,23 +17,7 @@ export const HANDOFF_BRIEF_MAX_CHARS = 4096;
 export const HANDOFF_BRIEF_TRUNCATED_MARKER = "[truncated]";
 
 export interface SessionAdvancePort {
-  /**
-   * Wait for the current run loop to settle before issuing newSession.
-   * Per the U9 contract: optional; absent on real Pi 0.81.1
-   * `ExtensionContext` (which only carries it on `ExtensionCommandContext`).
-   * The fake and any future-compatible runtime can supply it.
-   */
-  waitForIdle?(): Promise<void>;
-  newSession(options: {
-    kickoff: string;
-  }): Promise<void>;
-  /**
-   * sendUserMessage is intentionally NOT used for stage advance — sending a
-   * message would merely stack history instead of resetting context. We
-   * model it here only so the seam can document that we never call it. The
-   * fake extends the port with it so ATDD can prove the negative.
-   */
-  sendUserMessage?(text: string): Promise<void>;
+  sendUserMessage(text: string): void | Promise<void>;
 }
 
 export interface SessionAdvanceInput {
@@ -147,13 +131,11 @@ function shouldAdvance(
  *
  * U9 contract:
  *  - When the seam decides to advance (see {@link shouldAdvance}):
- *      1. Awaits `port.waitForIdle?.()` if the port exposes it
- *         (skipping silently otherwise).
- *      2. Computes a kickoff via `buildStageUserMessage` plus a derived
- *         handoff brief (≤ HANDOFF_BRIEF_MAX_CHARS) and awaits
- *         `port.newSession({ kickoff })`.
- *      3. Does NOT call `port.sendUserMessage` (sending a message would
- *         only stack history — the whole point of U9 is to RESET context).
+ *      1. Computes a kickoff via `buildStageUserMessage` plus a derived
+ *         handoff brief (≤ HANDOFF_BRIEF_MAX_CHARS).
+ *      2. Uses Pi's event-safe `sendUserMessage` API to trigger the next turn.
+ *         The context hook removes prior-stage history before that turn is
+ *         sent to the model.
  *  - When the seam decides to no-op, it returns immediately without
  *    invoking ANY port method.
  *  - Every call is `await`ed end-to-end so the surrounding harness can be
@@ -182,12 +164,8 @@ export async function advanceAfterSettled(
     return;
   }
 
-  if (typeof port.waitForIdle === "function") {
-    await port.waitForIdle();
-  }
-
   const kickoff = buildNextKickoff(state, nextStage);
-  await port.newSession({ kickoff });
+  await port.sendUserMessage(kickoff);
 }
 
 // Re-exports keep the typed ParsedRalphPrompt/StageId import alive for tooling

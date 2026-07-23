@@ -56,5 +56,5 @@ npm test
 - 尚未完成小模型与基线行为的对比验证。
 - 对非 bash 工具或其他命令通道中的终止性 emit 尚无统一拦截保证。
 - 尚未完成 `print`/长时间运行场景的 soak 测试。
-- U9 的推进路径已通过 fake Pi 测试，但真实 Pi 0.81.1 上 `waitForIdle`、`sendUserMessage` 与 `newSession` 的运行时可用性和调用时序仍未真机验证；类型声明与实际 runtime 能力之间的差异仍是风险。
+- 阶段推进使用 Pi 0.81.1 的 `ExtensionAPI.sendUserMessage` 触发下一轮，并由 `context` hook 丢弃上一阶段历史；仍需用真实模型完成整条阶段链路的行为烟测。
 - 当本机缺少 `pi` 二进制时，smoke 只会自动跳过；发布或部署前仍需在安装了匹配版本 Pi 的环境中执行真实加载烟测。

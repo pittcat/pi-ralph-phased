@@ -10,14 +10,14 @@ import { persistFullPrompt } from "./persist.js";
 import { createSessionState, SessionStateStore } from "./session-state.js";
 import { rewriteContextMessages } from "./context-rewrite.js";
 import { executeStageDoneTool } from "./tools/stage-done.js";
-import { createStageMachine } from "./stage-machine.js";
+import { createStageMachineFromState } from "./stage-machine.js";
 import { advanceAfterSettled, type SessionAdvancePort } from "./advance.js";
 import {
   resolveToolCallGuard,
   type ToolCallGuardPort,
   type ToolCallEventShape,
 } from "./tool-call-guard.js";
-import type { RalphSessionState, StageId } from "./types.js";
+import type { ParsedRalphPrompt, RalphSessionState, StageId } from "./types.js";
 
 /**
  * Structural shape of `BeforeAgentStartEventResult`. The official name is
@@ -84,20 +84,47 @@ const RALPH_STAGE_DONE_PARAMETERS = {
   additionalProperties: false,
 } as const;
 
+/**
+ * U1 seam — extract the canonical StageId queue from a parsed Ralph prompt.
+ * Replaces the three inline `parsed.stages.map((s) => s.id) as StageId[]`
+ * call sites so the cast and ordering are locked in one place.
+ */
+export function stageIdsOf(parsed: ParsedRalphPrompt): StageId[] {
+  return parsed.stages.map((stage) => stage.id) as StageId[];
+}
+
+/**
+ * U1 seam — register a Pi event handler with a single local cast boundary.
+ *
+ * Pi 0.81.1's `ExtensionAPI.on` overloads use a discriminated union that does
+ * not expose a generic handler signature we can call from the host adapter
+ * without a runtime cast. Instead of repeating the cast at every registration
+ * site (and at every future hook addition), we centralise it here. U11 may
+ * replace this with a typed helper if Pi exposes one upstream.
+ */
+function registerPiHook<E extends string>(
+  pi: ExtensionAPI,
+  name: E,
+  handler: (event: unknown, ctx: unknown) => unknown,
+): void {
+  pi.on(name as never, (((event: unknown, ctx: unknown) =>
+    handler(event, ctx)) as unknown) as never);
+}
+
 export default function piRalphPhased(pi: ExtensionAPI): void {
   const store = new SessionStateStore();
 
-  pi.on("before_agent_start" as never, (((event: BeforeAgentStartEvent) =>
-    handleBeforeAgentStart(event, store)) as unknown) as never);
+  registerPiHook(pi, "before_agent_start", (event) =>
+    handleBeforeAgentStart(event as BeforeAgentStartEvent, store));
 
-  pi.on("context" as never, (((event: ContextEvent) =>
-    handleContext(event, store)) as unknown) as never);
+  registerPiHook(pi, "context", (event) =>
+    handleContext(event as ContextEvent, store));
 
-  pi.on("agent_settled" as never, (((event: unknown, ctx: unknown) =>
-    handleAgentSettled(event, ctx, store)) as unknown) as never);
+  registerPiHook(pi, "agent_settled", (event, ctx) =>
+    handleAgentSettled(event, ctx, store));
 
-  pi.on("tool_call" as never, (((event: unknown, ctx: unknown) =>
-    handleToolCall(event, ctx, store)) as unknown) as never);
+  registerPiHook(pi, "tool_call", (event, ctx) =>
+    handleToolCall(event, ctx, store));
 
   pi.registerTool({
     name: "ralph_stage_done",
@@ -107,8 +134,9 @@ export default function piRalphPhased(pi: ExtensionAPI): void {
     execute: async (
       _toolCallId: string,
       params: RalphStageDoneParams,
+      ctx?: unknown,
     ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> => {
-      return handleStageDone(params, store);
+      return handleStageDone(params, store, ctx);
     },
   } as never);
 }
@@ -123,7 +151,7 @@ async function handleBeforeAgentStart(
   if (!parsed) return;
 
   const fullPromptPath = await persistFullPrompt(event.prompt);
-  const stageIds = parsed.stages.map((stage) => stage.id) as StageId[];
+  const stageIds = stageIdsOf(parsed);
 
   const state = createSessionState({
     originalPrompt: event.prompt,
@@ -153,8 +181,12 @@ function handleContext(
 async function handleStageDone(
   params: RalphStageDoneParams,
   store: SessionStateStore,
+  ctx?: unknown,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
-  const state = store.active;
+  // U1: prefer the live in-memory state, but fall back to whatever the host
+  // attaches to the tool ctx (production Pi 0.81.1 does not; the U9 ATDD
+  // fake does — same seam `handleAgentSettled` already uses).
+  const state = store.active ?? readSeededState(ctx);
   if (state === undefined) {
     return {
       content: [{ type: "text", text: "ralph_stage_done rejected: no active Ralph session." }],
@@ -162,8 +194,11 @@ async function handleStageDone(
     };
   }
 
-  const stageIds = state.parsed.stages.map((stage) => stage.id) as StageId[];
-  const machine = createStageMachine(stageIds);
+  // U1: build the machine from the live state so a repeated
+  // `completeStage(state.currentStage)` is a legal idempotent success and the
+  // queue position matches `state.currentStage` even after a previous
+  // `ralph_stage_done` already advanced through this handler.
+  const machine = createStageMachineFromState(state);
 
   const result = await executeStageDoneTool(
     {
@@ -175,10 +210,20 @@ async function handleStageDone(
 
   // Advance the in-memory session state so the next context rewrite uses
   // the new stage's short message. U9 will replace this in-memory tracking
-  // with the real `newSession` flow.
+  // with the real `newSession` flow. When the active state came from a
+  // host-seeded store (test-only seam — see `readSeededState`), also
+  // write back to that store so downstream observers (Fake ATDD included)
+  // see the same advance and can drive the next `ralph_stage_done` call
+  // against the live state.
   const next = applyTransition(state, result.transition);
   if (next !== undefined) {
     store.set(next);
+    if (ctx !== null && typeof ctx === "object") {
+      const seededStore = (ctx as { store?: { set?: (s: RalphSessionState) => void } }).store;
+      if (seededStore !== undefined && typeof seededStore.set === "function") {
+        seededStore.set(next);
+      }
+    }
   }
 
   return {

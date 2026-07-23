@@ -20,13 +20,7 @@ export interface CreateSessionStateInput {
  * - Be deterministic so `context-rewrite.ts` and the ATDD can replay it.
  */
 export function createSessionState(input: CreateSessionStateInput): RalphSessionState {
-  const parsedStages = input.parsed.stages.map((stage) => stage.id);
-  const queue: StageId[] =
-    input.stageIds.length > 0
-      ? [...input.stageIds]
-      : parsedStages;
-
-  const machine = createStageMachine(queue);
+  const machine = createStageMachine(input.stageIds);
   const currentStage = input.currentStage ?? machine.current;
   if (currentStage === undefined) {
     throw new Error("createSessionState: cannot derive a current stage from an empty queue");

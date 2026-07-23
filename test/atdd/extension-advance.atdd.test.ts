@@ -85,8 +85,14 @@ async function driveStageDone(
   const execute = tool.definition["execute"] as unknown as (
     toolCallId: string,
     params: Record<string, unknown>,
+    ctx?: unknown,
   ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
-  return execute(toolCall.tool_call_id, toolCall.args);
+  // Mirror the U9 agent_settled seam: the fake exposes `store` on the
+  // tool ctx so `handleStageDone` can read the seeded state via the same
+  // `readSeededState` fallback that `handleAgentSettled` uses. Production
+  // Pi 0.81.1 never sets `store` on a tool ctx, so the production path
+  // falls back to the in-memory store.
+  return execute(toolCall.tool_call_id, toolCall.args, { store: fake.store });
 }
 
 /**
@@ -219,18 +225,48 @@ describe("U9 ATDD — no overlap with U8 first-turn surface", () => {
 });
 
 describe("U9 ATDD — end-to-end through tool execute", () => {
-  it("a stage_done tool call returns the tool-side result without invoking the session port", async () => {
+  it("drives a multi-stage progression through the wired ralph_stage_done handler", async () => {
     const fake = await loadExtension();
+
+    // Seed a freshly created session state at orientation with no completed
+    // stages. The `seed` helper builds via `createSessionState` so the
+    // live state's `currentStage` and `completedStages` come from the real
+    // factory, not from a hand-rolled object.
     seed(fake, "orientation", []);
 
-    await driveStageDone(fake, {
+    // First tool call: mark ORIENTATION done. The wired handler must:
+    //  - accept the call against the live state,
+    //  - return content that mentions advancing to the next stage,
+    //  - leave `fake.store.active` at currentStage="tool_discipline".
+    const first = await driveStageDone(fake, {
       tool_call_id: "tc-orientation-1",
       name: "ralph_stage_done",
       args: { stage: "orientation" },
     });
+    expect(first.content[0]?.type).toBe("text");
+    const firstText = first.content[0]?.text ?? "";
+    // First call should report advance to tool_discipline (the next stage).
+    expect(firstText).toMatch(/advanced to 'tool_discipline'/);
+    expect(fake.store.active?.currentStage).toBe("tool_discipline");
 
-    // Tool execution must NOT have called any session port. Only the
-    // agent_settled hook is the one allowed to do that.
+    // Second tool call without re-seeding: this is the regression target.
+    // The handler MUST read from the live state that the first call just
+    // mutated, NOT rebuild a fresh machine from the parsed queue starting
+    // at orientation. If it did, `completeStage("tool_discipline")` would
+    // be rejected as out-of-order against a queue whose current is
+    // orientation.
+    const second = await driveStageDone(fake, {
+      tool_call_id: "tc-tool-discipline-1",
+      name: "ralph_stage_done",
+      args: { stage: "tool_discipline" },
+    });
+    const secondText = second.content[0]?.text ?? "";
+    // The second tool call must advance from tool_discipline to execute.
+    expect(secondText).toMatch(/advanced.*execute/i);
+    expect(fake.store.active?.currentStage).toBe("execute");
+
+    // Tool execution must NEVER have called any session port — the port is
+    // reserved for the agent_settled hook.
     expect(fake.session.calls).toHaveLength(0);
   });
 });

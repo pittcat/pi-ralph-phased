@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { createStageMachine } from "../../src/stage-machine.js";
-import type { StageId } from "../../src/types.js";
+import { createStageMachine, createStageMachineFromState } from "../../src/stage-machine.js";
+import { stageIdsOf } from "../../src/index.js";
+import { parseRalphPrompt } from "../../src/parse.js";
+import { createSessionState } from "../../src/session-state.js";
+import type { RalphSessionState, StageId } from "../../src/types.js";
 
 const ALL_STAGES = [
   "orientation",
@@ -158,5 +161,147 @@ describe("createStageMachine — empty queue", () => {
 
   it("has no next stage", () => {
     expect(createStageMachine([]).nextId).toBeUndefined();
+  });
+});
+
+describe("createStageMachineFromState — alignment with live state", () => {
+  const STANDARD_RALPH = `You are Ralph, the autonomous implementation hat.
+
+### 0. ORIENTATION
+Orient stage body marker.
+
+### 0b. TOOL DISCIPLINE
+Tool discipline stage body marker.
+
+### 1. EXECUTE
+Execute stage body marker.
+
+<ralph-tools-skill id="delivery">Deferred skill XML body marker.</ralph-tools-skill>
+
+### 2. VERIFY
+Verify stage body marker.
+
+### 3. REPORT
+Report stage body marker.
+`;
+
+  function buildState(
+    currentStage: StageId,
+    completed: ReadonlyArray<StageId>,
+  ): RalphSessionState {
+    const parsed = parseRalphPrompt(STANDARD_RALPH);
+    if (!parsed) throw new Error("fixture must parse");
+    const base = createSessionState({
+      originalPrompt: STANDARD_RALPH,
+      fullPromptPath: "/tmp/prompt.md",
+      parsed,
+      stageIds: parsed.stages.map((s) => s.id) as StageId[],
+      currentStage,
+    });
+    return { ...base, completedStages: new Set<StageId>(completed) };
+  }
+
+  it("starts at the live currentStage instead of stages[0]", () => {
+    const state = buildState("execute", ["orientation", "tool_discipline"]);
+    const machine = createStageMachineFromState(state);
+
+    expect(machine.current).toBe("execute");
+    expect(machine.nextId).toBe("verify");
+    expect(machine.isComplete).toBe(false);
+  });
+
+  it("treats a repeated completeStage(live current) as idempotent success", () => {
+    const state = buildState("tool_discipline", ["orientation"]);
+    const machine = createStageMachineFromState(state);
+
+    // First legal completion: tool_discipline -> execute.
+    expect(machine.completeStage("tool_discipline")).toEqual({ ok: true, advancedTo: "execute" });
+    // Repeating the same stage after completion must NOT be an error.
+    expect(machine.completeStage("tool_discipline")).toEqual({ ok: true });
+  });
+
+  it("preserves the parsed stage order and nextId even when started late", () => {
+    const state = buildState("verify", ["orientation", "tool_discipline", "execute"]);
+    const machine = createStageMachineFromState(state);
+
+    expect(machine.completeStage("verify")).toEqual({ ok: true, advancedTo: "report" });
+  });
+
+  it("marks the machine complete when currentStage is the last parsed stage", () => {
+    const state = buildState("report", ["orientation", "tool_discipline", "execute", "verify"]);
+    const machine = createStageMachineFromState(state);
+
+    expect(machine.completeStage("report")).toEqual({ ok: true });
+    expect(machine.isComplete).toBe(true);
+  });
+
+  it("throws when currentStage is not present in parsed stages", () => {
+    // Forge an inconsistent state: currentStage claims `execute` but the
+    // parsed queue only has orientation and report.
+    const inconsistent: RalphSessionState = {
+      originalPrompt: STANDARD_RALPH,
+      fullPromptPath: "/tmp/prompt.md",
+      parsed: {
+        preamble: "",
+        stages: [
+          { id: "orientation", title: "ORIENTATION", body: "" },
+          { id: "report", title: "REPORT", body: "" },
+        ],
+        deferredSkills: [],
+        publishTopics: [],
+      },
+      currentStage: "execute",
+      completedStages: new Set<StageId>(),
+      pendingAdvance: false,
+    };
+
+    expect(() => createStageMachineFromState(inconsistent)).toThrow(
+      /currentStage 'execute' is not present/i,
+    );
+  });
+
+  it("survives a second completeStage after the first has already advanced", () => {
+    const state = buildState("orientation", []);
+    const machine = createStageMachineFromState(state);
+
+    expect(machine.completeStage("orientation")).toEqual({ ok: true, advancedTo: "tool_discipline" });
+    expect(machine.completeStage("tool_discipline")).toEqual({ ok: true, advancedTo: "execute" });
+    expect(machine.current).toBe("execute");
+  });
+});
+
+describe("stageIdsOf — StageId queue derivation", () => {
+  const STANDARD_RALPH = `You are Ralph, the autonomous implementation hat.
+
+### 0. ORIENTATION
+Orient stage body marker.
+
+### 0b. TOOL DISCIPLINE
+Tool discipline stage body marker.
+
+### 1. EXECUTE
+Execute stage body marker.
+
+### 2. VERIFY
+Verify stage body marker.
+
+### 3. REPORT
+Report stage body marker.
+`;
+
+  it("returns the StageId queue in parsed order", () => {
+    const parsed = parseRalphPrompt(STANDARD_RALPH);
+    if (!parsed) throw new Error("fixture must parse");
+    expect(stageIdsOf(parsed)).toEqual([
+      "orientation",
+      "tool_discipline",
+      "execute",
+      "verify",
+      "report",
+    ]);
+  });
+
+  it("returns an empty array for an empty parsed stage list", () => {
+    expect(stageIdsOf({ preamble: "", stages: [], deferredSkills: [], publishTopics: [] })).toEqual([]);
   });
 });
